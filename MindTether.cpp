@@ -14,6 +14,9 @@
 #include <vector>
 #include <fstream>
 #include <cstdlib>   // 提供 _wtof, _wtoi
+//数据收集相关头文件
+#include <sstream>
+#include <iomanip>
 
 
 #define MAX_LOADSTRING 100
@@ -22,6 +25,8 @@
 #define ID_BTN_REST      1002
 #define ID_BTN_SETTINGS  1003
 #define ID_BTN_EXIT      1004
+// ==== 数据收集相关 ====
+#define THINK_THRESHOLD_SEC   155   // 时间阈值，2分35秒，超过这时间视为休息，测试时
 
 
 // 全局变量:
@@ -45,6 +50,14 @@ HWND hBtnSettings = nullptr;
 HWND hBtnExit = nullptr;
 double defaultRestMinutes = 10.0;   // 默认休息分钟数
 int    ringCount = 6;              // 蜂鸣次数
+//数据收集相关
+bool isPausing = false;              // 是否正处于“暂停”状态
+const int LEARN = 1;
+const int THINK = 2;
+const int REST = 3;
+time_t pauseStartTimeStamp = 0;   // 记录暂停开始的时刻（time_t）
+time_t learningStartTime = 0;   // 记录当前学习段开始的时刻（time_t）,用于计算本次学习持续多久
+
 
 // 此代码模块中包含的函数的前向声明:
 ATOM                MyRegisterClass(HINSTANCE hInstance);
@@ -166,6 +179,76 @@ void Remind() {
 }
 
 
+// 获取当前时间，格式 HH:MM:SS
+std::string GetNowTime() {
+    time_t now = time(nullptr);
+    tm tm_now;
+    localtime_s(&tm_now, &now);
+    std::ostringstream ss;
+    ss << std::put_time(&tm_now, "%H:%M:%S");
+    return ss.str();
+}
+// 获取当前日期，格式 YYYY-MM-DD
+std::string GetTodayDate() {
+    time_t now = time(nullptr);
+    tm tm_now;
+    localtime_s(&tm_now, &now);
+    std::ostringstream ss;
+    ss << std::put_time(&tm_now, "%Y-%m-%d");
+    return ss.str();
+}
+// 写一条学习数据到 study_log.csv
+void WriteStudyLog(const std::string& typeText, int durationSec) {
+    if (durationSec <= 0) return;
+
+    // 计算当前行数（用于生成ID）
+    std::ifstream readLast("study_log.csv");
+    int lastID = 0;
+    if (readLast.is_open()) {
+        std::string line;
+        bool firstLine = true;   // 跳过表头
+        while (std::getline(readLast, line)) {
+            if (firstLine) {
+                firstLine = false;
+                continue;
+            }
+            if (!line.empty()) {
+                int id = 0;
+                sscanf_s(line.c_str(), "%d,", &id);
+                lastID = id;
+            }
+        }
+        readLast.close();
+    }
+    int newID = lastID + 1;
+
+    // 以下原有逻辑
+    std::ofstream file("study_log.csv", std::ios::app | std::ios::binary);
+    if (!file) return;
+    // 判断文件是否为空（即新文件），如果是则写入表头
+    file.seekp(0, std::ios::end);
+    if (file.tellp() == 0) {
+        file << "ID,Date,StartTime,EndTime,Status,Duration(sec)\n";
+    }
+    // ... 时间计算
+    time_t end = time(nullptr);
+    tm tm_end;
+    localtime_s(&tm_end, &end);
+    char dateBuf[20], endTime[10], startTime[10];
+    strftime(dateBuf, 20, "%Y-%m-%d", &tm_end);
+    strftime(endTime, 10, "%H:%M:%S", &tm_end);
+    time_t start = end - durationSec;
+    tm tm_start;
+    localtime_s(&tm_start, &start);
+    strftime(startTime, 10, "%H:%M:%S", &tm_start);
+
+    // 写入时带上ID
+    file << newID << "," << dateBuf << "," << startTime << "," << endTime << ","
+        << typeText << "," << durationSec << "\n";
+    file.close();
+}
+
+
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
                      _In_opt_ HINSTANCE hPrevInstance,
                      _In_ LPWSTR    lpCmdLine,
@@ -219,6 +302,10 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
         return -1;
     }
 
+    // 如果启动时 Edge 正在播放，则记录学习开始时间
+    if (IsEdgePlaying(pSessionManager)) {
+        learningStartTime = time(nullptr);
+    }
 
     UNREFERENCED_PARAMETER(hPrevInstance);
     UNREFERENCED_PARAMETER(lpCmdLine);
@@ -400,23 +487,51 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             updateCounter++;
 
             if (playing) {
-                // 恢复播放 → 重置休息计时
+                // ---- 状态切换：如果之前是暂停，现在恢复播放 ----
+                if (isPausing) {
+                    time_t now = time(nullptr);
+                    int pauseSec = (int)difftime(now, pauseStartTimeStamp);
+                    if (pauseSec > 0) {
+                        if (pauseSec <= THINK_THRESHOLD_SEC)
+                            WriteStudyLog("Think", pauseSec);
+                        else
+                            WriteStudyLog("Rest", pauseSec);
+                    }
+                    isPausing = false;
+                    learningStartTime = now;          // 开始新的学习段
+                }
+
+                // ---- 原有 UI 重置 ----
                 restSeconds = 0;
                 reminded = false;
                 SetWindowTextW(hStatusText, L"当前状态：正在播放");
-                // 确保按钮回到初始状态
                 ShowWindow(hBtnContinue, SW_HIDE);
                 ShowWindow(hBtnRest, SW_HIDE);
             }
             else {
-                // 没有播放
-                if (restSeconds == 0 && !reminded) {
-                    // 刚开始休息，设定总休息时间（测试用10秒，正式版600）
-                    restSeconds = remindInterval;
+                // ---- 状态切换：如果之前是播放，现在暂停 ----
+                if (!isPausing) {
+                    time_t now = time(nullptr);
+                    // 记录刚结束的学习段
+                    if (learningStartTime > 0) {
+                        int studySec = (int)difftime(now, learningStartTime);
+                        if (studySec > 0)
+                            WriteStudyLog("Study", studySec);
+                        learningStartTime = 0;
+                    }
+                    // 开始暂停计时
+                    pauseStartTimeStamp = now;
+                    isPausing = true;
+
+                    // 开始休息倒计时（原有逻辑）
+                    if (restSeconds == 0 && !reminded) {
+                        restSeconds = remindInterval;
+                    }
                 }
 
+                // ---- 倒计时与提醒逻辑（原有，但注意判断顺序）----
                 if (restSeconds > 0) {
-                    restSeconds--;   // 每秒减1
+                    restSeconds--;
                 }
 
                 if (restSeconds > 0) {
@@ -430,10 +545,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                     SetWindowTextW(hStatusText, L"该继续学习了！");
                 }
 
-                // 如果倒计时到0，且还未提醒
                 if (restSeconds == 0 && !reminded) {
-                    Remind();   // 蜂鸣提醒（保留）
-                    // 不弹窗，改为在窗口中显示提醒文字，并显示全部按钮
+                    Remind();
                     SetWindowTextW(hStatusText, L"该回去学习了！");
                     ShowWindow(hBtnContinue, SW_SHOW);
                     ShowWindow(hBtnRest, SW_SHOW);
@@ -513,6 +626,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         break;
     case WM_DESTROY:            //释放资源
         KillTimer(hWnd, 1);
+
+        if (learningStartTime > 0) {
+            time_t now = time(nullptr);
+            int studySec = (int)difftime(now, learningStartTime);
+            if (studySec > 0) WriteStudyLog("学习", studySec);
+            learningStartTime = 0;
+        }
+
         if (pSessionEnumerator) { pSessionEnumerator->Release(); pSessionEnumerator = nullptr; }
         if (pSessionManager) { pSessionManager->Release(); pSessionManager = nullptr; }
         if (pDevice) { pDevice->Release(); pDevice = nullptr; }
